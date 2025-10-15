@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 
 """
-General SAT Encoder for Metro Planning (Phase 3: Multiple Lines, strict turn counting)
-Refined for Scenario II and efficiency
+Optimized SAT Encoder - Balances speed and correctness
+Only expands bounding boxes for lines closest to popular cells
 """
 
 import sys
 import pickle
-# Assuming parser.py is available for import
 from parser import MetroProblem
-# import itertools # Not needed as naive at_most_k is removed
 
 class GeneralSATEncoder:
     def __init__(self, problem):
@@ -17,8 +15,9 @@ class GeneralSATEncoder:
         self.var_counter = 1
         self.clauses = []
         self.var_map = {}
-        # Stores (var_id, k) for turn variables to easily look up line k
-        self.turn_vars_by_line = {k: [] for k in range(problem.K)} 
+        self.turn_vars_by_line = {k: [] for k in range(problem.K)}
+
+        self.N, self.M, self.K = problem.N, problem.M, problem.K
 
     def new_var(self, description):
         if description not in self.var_map:
@@ -30,319 +29,476 @@ class GeneralSATEncoder:
         if literals:
             self.clauses.append(literals)
 
-    # Naive At-Most-One (AMO) encoding (O(n^2) clauses) - acceptable for small sets
     def at_most_one(self, variables):
-        for i in range(len(variables)):
-            for j in range(i + 1, len(variables)):
+        """O(n^2) AMO encoding"""
+        n = len(variables)
+        for i in range(n):
+            for j in range(i + 1, n):
                 self.add_clause([-variables[i], -variables[j]])
 
-    # EFFICIENT At-Most-K (AMK) using Sequential Counter Encoding (O(n*k) clauses)
     def at_most_k_efficient(self, variables, k, line_index):
+        """Sequential Counter Encoding"""
         n = len(variables)
+
         if k < 0:
             if n > 0:
-                 for v in variables:
-                     self.add_clause([-v])
+                for v in variables:
+                    self.add_clause([-v])
+            return
+
+        if k == 0:
+            for v in variables:
+                self.add_clause([-v])
             return
 
         if k >= n:
             return
 
-        # Pass 1: Define s_i_j for 1 <= j <= k
         for i in range(1, n + 1):
-            v_i = variables[i-1] # The i-th turn variable (0-indexed)
-
-            for j in range(1, k + 1):
+            v_i = variables[i-1]
+            for j in range(1, min(k + 1, i + 1)):
                 s_i_j = self.new_var(('seq_count', line_index, i, j))
 
-                # 1. Carry over: s_{i-1, j} -> s_{i, j} (Need i > 1)
-                # (-s_{i-1, j} OR s_{i, j})
                 if i > 1:
-                    s_prev_i_j = self.var_map[('seq_count', line_index, i - 1, j)]
-                    self.add_clause([-s_prev_i_j, s_i_j])
+                    s_prev_i_j = self.var_map.get(('seq_count', line_index, i - 1, j))
+                    if s_prev_i_j:
+                        self.add_clause([-s_prev_i_j, s_i_j])
 
-                # 2. Increment: (s_{i-1, j-1} AND v_i) -> s_{i, j}
-                # CNF: (-s_{i-1, j-1} OR -v_i OR s_{i, j})
-                
-                # Case 1: j=1. Rule simplifies to (v_i) -> s_{i, 1}. (s_{i-1, 0} is implicitly True)
                 if j == 1:
                     self.add_clause([-v_i, s_i_j])
-                
-                # Case 2: j>1 and i>1. Normal case. (s_{i-1, j-1} must exist)
                 elif i > 1:
-                    s_prev_i_j_minus_1 = self.var_map[('seq_count', line_index, i - 1, j - 1)]
-                    self.add_clause([-s_prev_i_j_minus_1, -v_i, s_i_j])
-                
-                # Case 3: j>1 and i=1. (s_{0, j-1} is implicitly False) - Rule is trivially satisfied. Skip encoding.
+                    s_prev_i_j_minus_1 = self.var_map.get(('seq_count', line_index, i - 1, j - 1))
+                    if s_prev_i_j_minus_1:
+                        self.add_clause([-s_prev_i_j_minus_1, -v_i, s_i_j])
 
-
-        # Final Constraint: s_{n, k+1} must be FALSE.
-        # Propagate the k+1 column up to s_{n, k+1}.
         if k + 1 <= n:
-            s_i_k_plus_1 = None # Initialize to hold the last variable s_{n, k+1}
-
+            s_i_k_plus_1 = None
             for i in range(1, n + 1):
-                s_i_k_plus_1 = self.new_var(('seq_count', line_index, i, k + 1))
-                v_i = variables[i-1]
+                if k + 1 <= i:
+                    s_i_k_plus_1 = self.new_var(('seq_count', line_index, i, k + 1))
+                    v_i = variables[i-1]
 
-                # 1. Carry over: s_{i-1, k+1} -> s_{i, k+1}
-                if i > 1:
-                    s_prev_i_k_plus_1 = self.var_map[('seq_count', line_index, i - 1, k + 1)]
-                    self.add_clause([-s_prev_i_k_plus_1, s_i_k_plus_1])
-                
-                # 2. Increment: (s_{i-1, k} AND v_i) -> s_{i, k+1}
-                # CNF: (-s_{i-1, k} OR -v_i OR s_{i, k+1})
-                if i > 1:
-                    # s_{i-1, k} was defined in Pass 1 (since k >= 1)
-                    s_prev_i_k = self.var_map[('seq_count', line_index, i - 1, k)] 
-                    self.add_clause([-s_prev_i_k, -v_i, s_i_k_plus_1])
-                
-                # Case i=1 is skipped (s_{0, k} is implicitly False)
+                    if i > 1:
+                        s_prev = self.var_map.get(('seq_count', line_index, i - 1, k + 1))
+                        if s_prev:
+                            self.add_clause([-s_prev, s_i_k_plus_1])
 
-            # The overall constraint: The last s_{n, k+1} variable must be False
+                    if i > 1:
+                        s_prev_k = self.var_map.get(('seq_count', line_index, i - 1, k))
+                        if s_prev_k:
+                            self.add_clause([-s_prev_k, -v_i, s_i_k_plus_1])
+
             if s_i_k_plus_1 is not None:
                 self.add_clause([-s_i_k_plus_1])
 
+    def identify_lines_for_popular_cells(self):
+        """
+        SMART: Only expand buffers for lines closest to each popular cell
+        This maintains correctness while keeping performance
+        """
+        if self.problem.scenario != 2 or self.problem.P == 0:
+            return set()
+
+        lines_to_expand = set()
+
+        for px, py in self.problem.popular_cells:
+            # Find the closest 3-5 lines to this popular cell
+            distances = []
+            for k in range(self.K):
+                sx, sy = self.problem.lines[k][0]
+                ex, ey = self.problem.lines[k][1]
+
+                # Distance from popular cell to line's bounding box
+                min_dist_start = abs(px - sx) + abs(py - sy)
+                min_dist_end = abs(px - ex) + abs(py - ey)
+                min_dist = min(min_dist_start, min_dist_end)
+
+                distances.append((min_dist, k))
+
+            # Sort by distance and take closest lines
+            distances.sort()
+            # Expand at least 3 closest lines, or more if they're close
+            num_to_expand = 3
+            for i in range(num_to_expand):
+                if i < len(distances):
+                    lines_to_expand.add(distances[i][1])
+
+        return lines_to_expand
+
+    def calculate_buffer(self, k, sx, sy, ex, ey, J, expand_for_popular):
+        """
+        Calculate buffer - only expand for lines designated to reach popular cells
+        """
+        manhattan = abs(ex - sx) + abs(ey - sy)
+
+        # Base buffer
+        base_buffer = J * 2 + 5
+
+        # Additional buffer for long lines
+        grid_diagonal = (self.N + self.M) / 2
+        length_ratio = manhattan / grid_diagonal
+
+        if length_ratio > 0.8:
+            extra_buffer = int(manhattan * 0.15)
+        elif length_ratio > 0.5:
+            extra_buffer = int(manhattan * 0.10)
+        else:
+            extra_buffer = 0
+
+        total_buffer = base_buffer + extra_buffer
+        max_buffer = min(50, max(self.N // 3, self.M // 3, 5))
+        buffer = min(total_buffer, max_buffer)
+
+        # SMART: Only expand if this line is designated for popular cells
+        if expand_for_popular and self.problem.scenario == 2 and self.problem.P > 0:
+            for px, py in self.problem.popular_cells:
+                min_buffer_x = max(abs(px - sx), abs(px - ex))
+                min_buffer_y = max(abs(py - sy), abs(py - ey))
+                needed_buffer = max(min_buffer_x, min_buffer_y)
+
+                if needed_buffer > buffer:
+                    buffer = min(needed_buffer, max(self.N, self.M))
+
+        return buffer
 
     def create_variables(self):
-        N, M, K = self.problem.N, self.problem.M, self.problem.K
-        print(f"Creating variables for {N}x{M} grid, {K} lines...")
-        for k in range(K):
-            for x in range(N):
-                for y in range(M):
-                    # ('cell', k, x, y): Is cell (x, y) part of line k?
-                    self.new_var(('cell', k, x, y)) 
-                    # ('dir', k, x, y, d): Does line k exit cell (x, y) in direction d?
-                    for d in range(4):  # Directions: Right=0, Left=1, Down=2, Up=3
-                        self.new_var(('dir', k, x, y, d))
-                    # ('turn', k, x, y): Does line k make a turn at cell (x, y)?
-                    self.new_var(('turn', k, x, y)) 
-        print(f"Created {self.var_counter - 1} variables")
+        """
+        Create variables with smart buffer expansion
+        """
+        print(f"Creating variables for {self.N}x{self.M} grid, {self.K} lines...")
 
-    def encode_constraints(self):
-        N, M, K = self.problem.N, self.problem.M, self.problem.K
-        print(f"Encoding constraints for {K} lines...")
-        for k in range(K):
+        # Identify which lines should be expanded for popular cells
+        lines_to_expand = self.identify_lines_for_popular_cells()
+
+        if lines_to_expand:
+            print(f"  Popular cells: {self.problem.popular_cells}")
+            print(f"  Expanding buffers for {len(lines_to_expand)} lines closest to popular cells")
+
+        self.line_bounds = {}
+        total_cells = 0
+
+        for k in range(self.K):
             sx, sy = self.problem.lines[k][0]
             ex, ey = self.problem.lines[k][1]
-            J = self.problem.J # Max turns
-            print(f"Line {k}: ({sx},{sy}) -> ({ex},{ey}), max turns J={J}")
+
+            # Calculate buffer - only expand if this line is in lines_to_expand
+            expand = k in lines_to_expand
+            buffer = self.calculate_buffer(k, sx, sy, ex, ey, self.problem.J, expand)
+
+            min_x = max(0, min(sx, ex) - buffer)
+            max_x = min(self.N - 1, max(sx, ex) + buffer)
+            min_y = max(0, min(sy, ey) - buffer)
+            max_y = min(self.M - 1, max(sy, ey) + buffer)
+
+            self.line_bounds[k] = (min_x, max_x, min_y, max_y)
+
+            cells_in_bbox = (max_x - min_x + 1) * (max_y - min_y + 1)
+            total_cells += cells_in_bbox
+
+            # Create variables within bounding box
+            for x in range(min_x, max_x + 1):
+                for y in range(min_y, max_y + 1):
+                    self.new_var(('cell', k, x, y))
+                    for d in range(4):
+                        self.new_var(('dir', k, x, y, d))
+                    self.new_var(('turn', k, x, y))
+
+        print(f"Created {self.var_counter - 1} variables")
+        print(f"Average cells per line: {total_cells // self.K}")
+
+    def in_bounds(self, k, x, y):
+        """Check if cell (x,y) is in the bounding box for line k"""
+        min_x, max_x, min_y, max_y = self.line_bounds[k]
+        return min_x <= x <= max_x and min_y <= y <= max_y
+
+    def encode_constraints(self):
+        print(f"Encoding constraints for {self.K} lines...")
+
+        for k in range(self.K):
+            sx, sy = self.problem.lines[k][0]
+            ex, ey = self.problem.lines[k][1]
+            J = self.problem.J
+
+            if k % 10 == 0 or self.K <= 5:
+                print(f"  Processing line {k}/{self.K}...")
+
             self.encode_start_end(k, sx, sy, ex, ey)
             self.encode_path_connectivity(k, sx, sy, ex, ey)
             self.encode_turn_constraints(k, sx, sy, ex, ey, J)
-            self.encode_anti_parallel_directions(k) # Added anti-parallel constraint
-            
-        self.encode_no_overlap() # At most 1 line per cell
-        
-        if self.problem.scenario == 2 and self.problem.P > 0:
-            self.encode_popular_cells() # Every popular cell must be covered
+            self.encode_anti_parallel_directions(k)
 
+        self.encode_no_overlap()
+
+        if self.problem.scenario == 2 and self.problem.P > 0:
+            self.encode_popular_cells()
 
     def encode_start_end(self, k, sx, sy, ex, ey):
-        # The start and end cells MUST be part of line k
-        start_var = self.var_map[('cell', k, sx, sy)]
-        self.add_clause([start_var])
-        end_var = self.var_map[('cell', k, ex, ey)]
-        self.add_clause([end_var])
-        print(f" Added start/end constraints for line {k}")
+        start_var = self.var_map.get(('cell', k, sx, sy))
+        end_var = self.var_map.get(('cell', k, ex, ey))
+        if start_var:
+            self.add_clause([start_var])
+        if end_var:
+            self.add_clause([end_var])
 
     def encode_path_connectivity(self, k, sx, sy, ex, ey):
-        N, M = self.problem.N, self.problem.M
-        print(f" Encoding path connectivity for line {k}...")
-        for x in range(N):
-            for y in range(M):
-                cell_var = self.var_map[('cell', k, x, y)]
+        """Only process cells within bounding box"""
+        min_x, max_x, min_y, max_y = self.line_bounds[k]
+
+        for x in range(min_x, max_x + 1):
+            for y in range(min_y, max_y + 1):
+                cell_var = self.var_map.get(('cell', k, x, y))
+                if not cell_var:
+                    continue
+
                 outgoing, incoming = [], []
-                
-                # Outgoing directions from (x, y)
-                if x + 1 < N: # Right (0)
-                    outgoing.append(self.var_map[('dir', k, x, y, 0)])
-                if x - 1 >= 0: # Left (1)
-                    outgoing.append(self.var_map[('dir', k, x, y, 1)])
-                if y + 1 < M: # Down (2)
-                    outgoing.append(self.var_map[('dir', k, x, y, 2)])
-                if y - 1 >= 0: # Up (3)
-                    outgoing.append(self.var_map[('dir', k, x, y, 3)])
 
-                # Incoming directions to (x, y)
-                if x - 1 >= 0: # From Left (Right dir from x-1)
-                    incoming.append(self.var_map[('dir', k, x - 1, y, 0)])
-                if x + 1 < N: # From Right (Left dir from x+1)
-                    incoming.append(self.var_map[('dir', k, x + 1, y, 1)])
-                if y - 1 >= 0: # From Up (Down dir from y-1)
-                    incoming.append(self.var_map[('dir', k, x, y - 1, 2)])
-                if y + 1 < M: # From Down (Up dir from y+1)
-                    incoming.append(self.var_map[('dir', k, x, y + 1, 3)])
+                # Outgoing directions
+                if x + 1 < self.N and self.in_bounds(k, x + 1, y):
+                    dir_var = self.var_map.get(('dir', k, x, y, 0))
+                    if dir_var:
+                        outgoing.append(dir_var)
 
-                # 1. Flow for Start/End/Internal Cells
+                if x - 1 >= 0 and self.in_bounds(k, x - 1, y):
+                    dir_var = self.var_map.get(('dir', k, x, y, 1))
+                    if dir_var:
+                        outgoing.append(dir_var)
+
+                if y + 1 < self.M and self.in_bounds(k, x, y + 1):
+                    dir_var = self.var_map.get(('dir', k, x, y, 2))
+                    if dir_var:
+                        outgoing.append(dir_var)
+
+                if y - 1 >= 0 and self.in_bounds(k, x, y - 1):
+                    dir_var = self.var_map.get(('dir', k, x, y, 3))
+                    if dir_var:
+                        outgoing.append(dir_var)
+
+                # Incoming directions
+                if x - 1 >= 0 and self.in_bounds(k, x - 1, y):
+                    dir_var = self.var_map.get(('dir', k, x - 1, y, 0))
+                    if dir_var:
+                        incoming.append(dir_var)
+
+                if x + 1 < self.N and self.in_bounds(k, x + 1, y):
+                    dir_var = self.var_map.get(('dir', k, x + 1, y, 1))
+                    if dir_var:
+                        incoming.append(dir_var)
+
+                if y - 1 >= 0 and self.in_bounds(k, x, y - 1):
+                    dir_var = self.var_map.get(('dir', k, x, y - 1, 2))
+                    if dir_var:
+                        incoming.append(dir_var)
+
+                if y + 1 < self.M and self.in_bounds(k, x, y + 1):
+                    dir_var = self.var_map.get(('dir', k, x, y + 1, 3))
+                    if dir_var:
+                        incoming.append(dir_var)
+
+                # Flow constraints
                 if (x, y) == (sx, sy):
-                    # Start: Must have exactly one outgoing and zero incoming (if used)
                     if outgoing:
-                        self.add_clause([-cell_var] + outgoing) # cell -> at least one outgoing
-                        self.at_most_one(outgoing) # at most one outgoing
+                        self.add_clause([-cell_var] + outgoing)
+                        self.at_most_one(outgoing)
                     for in_dir_var in incoming:
-                        self.add_clause([-in_dir_var])  # start cell no incoming
+                        self.add_clause([-in_dir_var])
+
                 elif (x, y) == (ex, ey):
-                    # End: Must have exactly one incoming and zero outgoing (if used)
                     if incoming:
-                        self.add_clause([-cell_var] + incoming) # cell -> at least one incoming
-                        self.at_most_one(incoming) # at most one incoming
+                        self.add_clause([-cell_var] + incoming)
+                        self.at_most_one(incoming)
                     for out_dir_var in outgoing:
-                        self.add_clause([-out_dir_var])  # end cell no outgoing
+                        self.add_clause([-out_dir_var])
+
                 else:
-                    # Internal: Must have exactly one incoming AND exactly one outgoing (if used)
                     if incoming:
-                        self.add_clause([-cell_var] + incoming) # cell -> at least one incoming
+                        self.add_clause([-cell_var] + incoming)
                     if outgoing:
-                        self.add_clause([-cell_var] + outgoing) # cell -> at least one outgoing
-                    self.at_most_one(incoming) # at most one incoming
-                    self.at_most_one(outgoing) # at most one outgoing
+                        self.add_clause([-cell_var] + outgoing)
+                    if incoming:
+                        self.at_most_one(incoming)
+                    if outgoing:
+                        self.at_most_one(outgoing)
 
-                # 2. Link cell to direction variables: Direction implies cell
-                # If any direction variable is true, the current cell MUST be true
+                # Link directions to cells
                 for d_var in outgoing + incoming:
-                    self.add_clause([cell_var, -d_var]) # (-d_var OR cell_var) == (d_var -> cell_var)
+                    self.add_clause([cell_var, -d_var])
 
-                # 3. Direction variables imply next cell is true
                 self.encode_direction_implications(k, x, y)
 
-        print(f" Added connectivity for all cells for line {k}")
-
     def encode_direction_implications(self, k, x, y):
-        N, M = self.problem.N, self.problem.M
-        # Right (0)
-        if x + 1 < N:
-            dir_var = self.var_map[('dir', k, x, y, 0)]
-            next_cell = self.var_map[('cell', k, x + 1, y)]
-            self.add_clause([-dir_var, next_cell])
-        # Left (1)
-        if x - 1 >= 0:
-            dir_var = self.var_map[('dir', k, x, y, 1)]
-            next_cell = self.var_map[('cell', k, x - 1, y)]
-            self.add_clause([-dir_var, next_cell])
-        # Down (2)
-        if y + 1 < M:
-            dir_var = self.var_map[('dir', k, x, y, 2)]
-            next_cell = self.var_map[('cell', k, x, y + 1)]
-            self.add_clause([-dir_var, next_cell])
-        # Up (3)
-        if y - 1 >= 0:
-            dir_var = self.var_map[('dir', k, x, y, 3)]
-            next_cell = self.var_map[('cell', k, x, y - 1)]
-            self.add_clause([-dir_var, next_cell])
+        # Right
+        if x + 1 < self.N and self.in_bounds(k, x + 1, y):
+            dir_var = self.var_map.get(('dir', k, x, y, 0))
+            next_cell = self.var_map.get(('cell', k, x + 1, y))
+            if dir_var and next_cell:
+                self.add_clause([-dir_var, next_cell])
+
+        # Left
+        if x - 1 >= 0 and self.in_bounds(k, x - 1, y):
+            dir_var = self.var_map.get(('dir', k, x, y, 1))
+            next_cell = self.var_map.get(('cell', k, x - 1, y))
+            if dir_var and next_cell:
+                self.add_clause([-dir_var, next_cell])
+
+        # Down
+        if y + 1 < self.M and self.in_bounds(k, x, y + 1):
+            dir_var = self.var_map.get(('dir', k, x, y, 2))
+            next_cell = self.var_map.get(('cell', k, x, y + 1))
+            if dir_var and next_cell:
+                self.add_clause([-dir_var, next_cell])
+
+        # Up
+        if y - 1 >= 0 and self.in_bounds(k, x, y - 1):
+            dir_var = self.var_map.get(('dir', k, x, y, 3))
+            next_cell = self.var_map.get(('cell', k, x, y - 1))
+            if dir_var and next_cell:
+                self.add_clause([-dir_var, next_cell])
 
     def encode_turn_constraints(self, k, sx, sy, ex, ey, J):
-        N, M = self.problem.N, self.problem.M
-        # Directions are 0:Right, 1:Left, 2:Down, 3:Up
+        """Only process cells within bounding box"""
+        min_x, max_x, min_y, max_y = self.line_bounds[k]
 
-        for x in range(N):
-            for y in range(M):
-                turn_var = self.var_map[('turn', k, x, y)]
-                cell_var = self.var_map[('cell', k, x, y)]
+        for x in range(min_x, max_x + 1):
+            for y in range(min_y, max_y + 1):
+                turn_var = self.var_map.get(('turn', k, x, y))
+                if not turn_var:
+                    continue
 
-                # Endpoints cannot be turns
+                cell_var = self.var_map.get(('cell', k, x, y))
+
                 if (x, y) == (sx, sy) or (x, y) == (ex, ey):
                     self.add_clause([-turn_var])
                     continue
 
-                # turn_var -> cell_var (optional, but good)
-                self.add_clause([-turn_var, cell_var])
-                
-                # --- Define Turn ---
-                # turn_var is true IFF incoming direction is NOT the same as outgoing direction
-                
-                # 1. Get incoming and outgoing direction variables (same as in connectivity)
+                if cell_var:
+                    self.add_clause([-turn_var, cell_var])
+
+                # Get incoming and outgoing directions
                 in_dirs, out_dirs = [], []
-                # In from Left (Dir Right) -> Incoming dir is Right (0)
-                if x - 1 >= 0: in_dirs.append((0, self.var_map[('dir', k, x - 1, y, 0)])) 
-                # In from Right (Dir Left) -> Incoming dir is Left (1)
-                if x + 1 < N: in_dirs.append((1, self.var_map[('dir', k, x + 1, y, 1)])) 
-                # In from Up (Dir Down) -> Incoming dir is Down (2)
-                if y - 1 >= 0: in_dirs.append((2, self.var_map[('dir', k, x, y - 1, 2)])) 
-                # In from Down (Dir Up) -> Incoming dir is Up (3)
-                if y + 1 < M: in_dirs.append((3, self.var_map[('dir', k, x, y + 1, 3)])) 
-                
-                if x + 1 < N: out_dirs.append((0, self.var_map[('dir', k, x, y, 0)])) # Out Right (0)
-                if x - 1 >= 0: out_dirs.append((1, self.var_map[('dir', k, x, y, 1)])) # Out Left (1)
-                if y + 1 < M: out_dirs.append((2, self.var_map[('dir', k, x, y, 2)])) # Out Down (2)
-                if y - 1 >= 0: out_dirs.append((3, self.var_map[('dir', k, x, y, 3)])) # Out Up (3)
-                
-                # 2. Implication: (in_dir & out_dir) -> turn_var, if directions are DIFFERENT (Turn)
-                # CNF: (-idir_var OR -odir_var OR turn_var)
+
+                if x - 1 >= 0 and self.in_bounds(k, x - 1, y):
+                    v = self.var_map.get(('dir', k, x - 1, y, 0))
+                    if v: in_dirs.append((0, v))
+
+                if x + 1 < self.N and self.in_bounds(k, x + 1, y):
+                    v = self.var_map.get(('dir', k, x + 1, y, 1))
+                    if v: in_dirs.append((1, v))
+
+                if y - 1 >= 0 and self.in_bounds(k, x, y - 1):
+                    v = self.var_map.get(('dir', k, x, y - 1, 2))
+                    if v: in_dirs.append((2, v))
+
+                if y + 1 < self.M and self.in_bounds(k, x, y + 1):
+                    v = self.var_map.get(('dir', k, x, y + 1, 3))
+                    if v: in_dirs.append((3, v))
+
+                if x + 1 < self.N and self.in_bounds(k, x + 1, y):
+                    v = self.var_map.get(('dir', k, x, y, 0))
+                    if v: out_dirs.append((0, v))
+
+                if x - 1 >= 0 and self.in_bounds(k, x - 1, y):
+                    v = self.var_map.get(('dir', k, x, y, 1))
+                    if v: out_dirs.append((1, v))
+
+                if y + 1 < self.M and self.in_bounds(k, x, y + 1):
+                    v = self.var_map.get(('dir', k, x, y, 2))
+                    if v: out_dirs.append((2, v))
+
+                if y - 1 >= 0 and self.in_bounds(k, x, y - 1):
+                    v = self.var_map.get(('dir', k, x, y, 3))
+                    if v: out_dirs.append((3, v))
+
+                # Turn definitions
                 for (din, idir_var) in in_dirs:
                     for (dout, odir_var) in out_dirs:
                         if din != dout:
                             self.add_clause([-idir_var, -odir_var, turn_var])
-
-                # 3. Implication: (in_dir & out_dir) -> -turn_var, if directions are the SAME (Straight)
-                # CNF: (-idir_var OR -odir_var OR -turn_var)
-                # This explicitly limits the Turn variable which helps the SAT solver.
-                for (din, idir_var) in in_dirs:
-                    for (dout, odir_var) in out_dirs:
-                        if din == dout:
+                        else:
                             self.add_clause([-idir_var, -odir_var, -turn_var])
 
-                # --- Turn Count Storage ---
                 self.turn_vars_by_line[k].append(turn_var)
 
-        # --- Enforce Global Turn Limit J ---
+        # Turn limit
         turn_vars_for_line = self.turn_vars_by_line[k]
         self.at_most_k_efficient(turn_vars_for_line, J, k)
-        print(f" Added turn limit constraint for line {k} (J={J}) using efficient counter")
-    
+
     def encode_anti_parallel_directions(self, k):
-        # Adds constraint: A line cannot immediately reverse direction between two adjacent cells.
-        # e.g., Dir(x,y,Right) AND Dir(x+1,y,Left) is forbidden.
-        N, M = self.problem.N, self.problem.M
+        """Only process cells within bounding box"""
+        min_x, max_x, min_y, max_y = self.line_bounds[k]
 
-        for x in range(N):
-            for y in range(M):
-                # Out Right (0) to In Left (1)
-                if x + 1 < N:
-                    dir_out = self.var_map[('dir', k, x, y, 0)]      
-                    dir_in = self.var_map[('dir', k, x + 1, y, 1)] 
-                    self.add_clause([-dir_out, -dir_in])
+        for x in range(min_x, max_x + 1):
+            for y in range(min_y, max_y + 1):
+                if x + 1 < self.N and self.in_bounds(k, x + 1, y):
+                    dir_out = self.var_map.get(('dir', k, x, y, 0))
+                    dir_in = self.var_map.get(('dir', k, x + 1, y, 1))
+                    if dir_out and dir_in:
+                        self.add_clause([-dir_out, -dir_in])
 
-                # Out Left (1) to In Right (0)
-                if x - 1 >= 0:
-                    dir_out = self.var_map[('dir', k, x, y, 1)]      
-                    dir_in = self.var_map[('dir', k, x - 1, y, 0)] 
-                    self.add_clause([-dir_out, -dir_in])
+                if x - 1 >= 0 and self.in_bounds(k, x - 1, y):
+                    dir_out = self.var_map.get(('dir', k, x, y, 1))
+                    dir_in = self.var_map.get(('dir', k, x - 1, y, 0))
+                    if dir_out and dir_in:
+                        self.add_clause([-dir_out, -dir_in])
 
-                # Out Down (2) to In Up (3)
-                if y + 1 < M:
-                    dir_out = self.var_map[('dir', k, x, y, 2)]      
-                    dir_in = self.var_map[('dir', k, x, y + 1, 3)] 
-                    self.add_clause([-dir_out, -dir_in])
+                if y + 1 < self.M and self.in_bounds(k, x, y + 1):
+                    dir_out = self.var_map.get(('dir', k, x, y, 2))
+                    dir_in = self.var_map.get(('dir', k, x, y + 1, 3))
+                    if dir_out and dir_in:
+                        self.add_clause([-dir_out, -dir_in])
 
-                # Out Up (3) to In Down (2)
-                if y - 1 >= 0:
-                    dir_out = self.var_map[('dir', k, x, y, 3)]      
-                    dir_in = self.var_map[('dir', k, x, y - 1, 2)] 
-                    self.add_clause([-dir_out, -dir_in])
+                if y - 1 >= 0 and self.in_bounds(k, x, y - 1):
+                    dir_out = self.var_map.get(('dir', k, x, y, 3))
+                    dir_in = self.var_map.get(('dir', k, x, y - 1, 2))
+                    if dir_out and dir_in:
+                        self.add_clause([-dir_out, -dir_in])
 
     def encode_no_overlap(self):
-        # Constraint 1: There is at most 1 metro line under any location
-        N, M, K = self.problem.N, self.problem.M, self.problem.K
-        print(f"Encoding non-collision constraints (no cell occupied by >1 line)...")
-        for x in range(N):
-            for y in range(M):
-                # Collect 'cell' variables for all lines k at (x, y)
-                vars_in_cell = [self.var_map[('cell', k, x, y)] for k in range(K)]
-                if len(vars_in_cell) > 1:
-                    self.at_most_one(vars_in_cell)
-        print(" Added cell non-overlap constraints")
-        
-    def encode_popular_cells(self):
-        # Scenario II Constraint: Every popular cell must be covered by at least one line
-        N, M, K = self.problem.N, self.problem.M, self.problem.K
-        print(f"Encoding popular cell constraints for {self.problem.P} cells...")
-        for x, y in self.problem.popular_cells:
-            # Clause: (cell_0,x,y OR cell_1,x,y OR ...)
-            vars_in_cell = [self.var_map[('cell', k, x, y)] for k in range(K)]
-            self.add_clause(vars_in_cell)
-        print(" Added popular cell constraints")
+        """Only check overlaps where bounding boxes intersect"""
+        print("Encoding non-collision constraints...")
 
+        # Build set of cells in any line's bounding box
+        cells_to_check = set()
+        for k in range(self.K):
+            min_x, max_x, min_y, max_y = self.line_bounds[k]
+            for x in range(min_x, max_x + 1):
+                for y in range(min_y, max_y + 1):
+                    cells_to_check.add((x, y))
+
+        for x, y in cells_to_check:
+            vars_in_cell = []
+            for k in range(self.K):
+                v = self.var_map.get(('cell', k, x, y))
+                if v:
+                    vars_in_cell.append(v)
+
+            if len(vars_in_cell) > 1:
+                self.at_most_one(vars_in_cell)
+
+        print("  Added cell non-overlap constraints")
+
+    def encode_popular_cells(self):
+        """
+        CORRECT: Ensures at least one line passes through each popular cell
+        """
+        print(f"Encoding popular cell constraints for {self.problem.P} cells...")
+
+        for x, y in self.problem.popular_cells:
+            vars_in_cell = []
+            for k in range(self.K):
+                v = self.var_map.get(('cell', k, x, y))
+                if v:
+                    vars_in_cell.append(v)
+
+            if vars_in_cell:
+                self.add_clause(vars_in_cell)
+                print(f"  Cell ({x},{y}): {len(vars_in_cell)} lines can reach it")
+            else:
+                # Popular cell unreachable - make UNSAT
+                print(f"  WARNING: Cell ({x},{y}) is unreachable by all lines!")
+                print(f"  Adding FALSE clause to make problem UNSAT")
+                self.add_clause([])
+
+        print("  Added popular cell constraints")
 
     def write_dimacs(self, filename):
         with open(filename, 'w') as f:
@@ -354,24 +510,29 @@ class GeneralSATEncoder:
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: encoder.py <basename>", file=sys.stderr)
+        print("Usage: encoder.py <base>", file=sys.stderr)
         sys.exit(1)
+
     base = sys.argv[1]
     input_file = base + ".city"
     output_file = base + ".satinput"
     varmap_file = base + ".varmap"
+
     try:
-        # NOTE: Assumes parser.py is available and working
-        problem = MetroProblem(input_file) 
+        problem = MetroProblem(input_file)
         print(f"Loaded: {problem}")
+
         encoder = GeneralSATEncoder(problem)
         encoder.create_variables()
         encoder.encode_constraints()
         encoder.write_dimacs(output_file)
+
         with open(varmap_file, 'wb') as f:
             pickle.dump(encoder.var_map, f)
+
         print(f"\nSuccess! Created {output_file}")
         print(f"Variables: {encoder.var_counter-1}, Clauses: {len(encoder.clauses)}")
+
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         import traceback
