@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Decodes SAT solution to metro map"""
 
 import sys
 import pickle
@@ -33,7 +32,7 @@ class SATDecoder:
                     self.assignment[-var] = False
     
     def decode(self):
-        """Convert SAT solution to paths"""
+        
         if not self.satisfiable:
             return None
         
@@ -45,7 +44,7 @@ class SATDecoder:
         return paths
     
     def extract_path_for_line(self, k):
-        """Extract the path for a single metro line"""
+        
         start_x, start_y = self.problem.lines[k][0]
         end_x, end_y = self.problem.lines[k][1]
         
@@ -53,14 +52,12 @@ class SATDecoder:
         current = (start_x, start_y)
         visited = set([current])
         
-        # Direction mapping: 0=R, 1=L, 2=D, 3=U
         dir_map = {0: ('R', 1, 0), 1: ('L', -1, 0), 2: ('D', 0, 1), 3: ('U', 0, -1)}
         
         while current != (end_x, end_y):
             x, y = current
             moved = False
             
-            # Check which direction is active
             for d in range(4):
                 dir_var = self.var_map.get(('dir', k, x, y, d))
                 if dir_var and self.assignment.get(dir_var, False):
@@ -75,10 +72,8 @@ class SATDecoder:
                         break
             
             if not moved:
-                # Couldn't find next move - path is incomplete
                 break
             
-            # Safety check: don't loop forever
             if len(visited) > self.problem.N * self.problem.M:
                 break
         
